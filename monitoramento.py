@@ -36,21 +36,29 @@ def run_analytics_query(
     Executa uma query parametrizada no Log Analytics Workspace.
     """
     
+    # --- LÓGICA DE CONSTRUÇÃO DE QUERY ATUALIZADA ---
+
     # 1. Colunas de agrupamento base
     group_by_columns = ["projeto", "usuario_executor"]
     if agrupar_por_modelo:
         group_by_columns.append("model_name")
 
-    # 2. Strings de KQL para agrupamento diário
-    daily_bin_extend_kql = ""
+    # 2. Lista de expressões 'extend'
+    #    Vamos construir o bloco 'extend' dinamicamente
+    extend_expressions = [
+        "projeto = tostring(msg_data.projeto)",
+        "usuario_executor = tostring(msg_data.usuario_executor)",
+        "model_name = tostring(msg_data.model_name)",
+        f"{coluna_token} = todouble(msg_data.{coluna_token})"
+    ]
+    
     daily_order_by_kql = ""
 
     if resultado_diario:
         daily_bin_column = "dia"
-        
         # --- CORREÇÃO AQUI ---
-        # Corrigido de 'timestamp' para 'Timestamp' (T maiúsculo)
-        daily_bin_extend_kql = f", {daily_bin_column} = bin(Timestamp, 1d)"
+        # Adiciona a extração, conversão e bin da coluna 'data_hora' DE DENTRO do JSON
+        extend_expressions.append(f"{daily_bin_column} = bin(todatetime(msg_data.data_hora), 1d)")
         
         group_by_columns.append(daily_bin_column)
         daily_order_by_kql = f"{daily_bin_column} asc, "
@@ -65,15 +73,15 @@ def run_analytics_query(
     
     if not analisar_por_job:
         # --- LÓGICA PADRÃO: Agregação por evento ---
+        
+        # Junta todas as expressões 'extend' com vírgulas
+        extend_clause = ",\n            ".join(extend_expressions)
+        
         kql_query = f"""
         AppTraces 
         | extend msg_data = parse_json(Message)
         | extend
-            projeto = tostring(msg_data.projeto),
-            usuario_executor = tostring(msg_data.usuario_executor),
-            model_name = tostring(msg_data.model_name),
-            {coluna_token} = todouble(msg_data.{coluna_token})
-            {daily_bin_extend_kql} 
+            {extend_clause}
         | where isnotnull({coluna_token})
         | summarize
             {nome_coluna} = {operacao}({coluna_token})
@@ -86,6 +94,10 @@ def run_analytics_query(
              raise HTTPException(status_code=400, 
                 detail="A operação 'sum' não é permitida com 'analisar_por_job=True', pois a agregação primária já é uma soma.")
         
+        # Adiciona a extração do job_id para a lógica de job
+        extend_expressions.append("job_id = tostring(msg_data.job_id)")
+        extend_clause = ",\n            ".join(extend_expressions)
+        
         # O agrupamento do Estágio 1 precisa do job_id
         stage_1_groupby_columns = group_by_columns + ["job_id"]
         stage_1_groupby_clause = ", ".join(stage_1_groupby_columns)
@@ -94,12 +106,7 @@ def run_analytics_query(
         AppTraces 
         | extend msg_data = parse_json(Message)
         | extend
-            projeto = tostring(msg_data.projeto),
-            usuario_executor = tostring(msg_data.usuario_executor),
-            model_name = tostring(msg_data.model_name),
-            job_id = tostring(msg_data.job_id),
-            {coluna_token} = todouble(msg_data.{coluna_token})
-            {daily_bin_extend_kql} 
+            {extend_clause}
         | where isnotnull({coluna_token}) and isnotnull(job_id)
         
         // Estágio 1: "soma do job_id" (Soma os tokens para cada job E dia)
@@ -164,7 +171,7 @@ async def get_stats(
     
     resultado_diario: bool = Query(
         default=False,
-        description="Se True, agrupa os resultados por dia (bin(Timestamp, 1d))."
+        description="Se True, agrupa os resultados por dia (usando 'data_hora' do JSON)."
     )
 ):
     """
