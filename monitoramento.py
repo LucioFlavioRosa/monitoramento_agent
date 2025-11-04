@@ -25,7 +25,7 @@ logs_client = LogsQueryClient(credential)
 # --- FUNÇÃO ATUALIZADA ---
 def run_analytics_query(
     dias: int, 
-    coluna_token: str, 
+    coluna_alvo: str, 
     operacao: str, 
     nome_coluna: str, 
     agrupar_por_modelo: bool,
@@ -49,7 +49,7 @@ def run_analytics_query(
         "projeto = tostring(msg_data.projeto)",
         "usuario_executor = tostring(msg_data.usuario_executor)",
         "model_name = tostring(msg_data.model_name)",
-        f"{coluna_token} = todouble(msg_data.{coluna_token})"
+        f"{coluna_alvo} = todouble(msg_data.{coluna_alvo})"
     ]
     
     daily_order_by_kql = ""
@@ -149,7 +149,7 @@ async def get_stats(
     # Validação automática de parâmetros de query:
     dias: int = Query(default=30, gt=0, description="Período de análise em dias."),
     
-    token: Literal["tokens_entrada", "tokens_saida"] = Query(
+    coluna_alvo: Literal["tokens_entrada", "tokens_saida", "job_id"] = Query(
         default="tokens_entrada",
         description="O tipo de token a ser analisado."
     ),
@@ -184,7 +184,7 @@ async def get_stats(
     coluna_saida = f"{op.capitalize()}_{token}"
     
     results = run_analytics_query(
-        dias, token, op, coluna_saida, 
+        dias, coluna_alvo, op, coluna_saida, 
         agrupar_por_modelo, analisar_por_job, resultado_diario
     )
     
