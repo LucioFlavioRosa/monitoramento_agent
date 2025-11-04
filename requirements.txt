@@ -1,5 +1,7 @@
 fastapi
 uvicorn
+gunicorn
 pandas
 azure-monitor-query
 azure-identity
+typing-extensions
