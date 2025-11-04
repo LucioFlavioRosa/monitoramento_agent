@@ -142,7 +142,7 @@ async def get_stats(
     dias: int = Query(default=30, gt=0, description="Período de análise em dias."),
     
     # --- CORRIGIDO (Literal) ---
-    coluna_alvo: Literal["tokens_entrada", "tokens_saida"] = Query(
+    coluna_alvo: Literal["tokens_entrada", "tokens_saida", "job_id"] = Query(
         default="tokens_entrada",
         description="A coluna de métrica a ser analisada."
     ),
