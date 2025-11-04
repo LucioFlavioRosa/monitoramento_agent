@@ -41,66 +41,77 @@ def run_analytics_query(
     if agrupar_por_modelo:
         group_by_columns.append("model_name")
 
-    # 2. Lista de expressões 'extend'
+    # 2. Lista de expressões 'extend' (base)
     extend_expressions = [
         "projeto = tostring(msg_data.projeto)",
         "usuario_executor = tostring(msg_data.usuario_executor)",
         "model_name = tostring(msg_data.model_name)"
     ]
     
-    daily_order_by_kql = ""
+    # 3. Lista de condições 'where' (base)
+    # --- LÓGICA ATUALIZADA ---
+    where_conditions = [] # Começa vazia
+    if agrupar_por_modelo:
+        # --- NOVA CONDIÇÃO ADICIONADA ---
+        # Se vamos agrupar por modelo, filtramos os nulos.
+        where_conditions.append("isnotnull(model_name)")
 
+    # 4. Lógica de agrupamento diário
+    daily_order_by_kql = ""
     if resultado_diario:
         daily_bin_column = "dia"
         extend_expressions.append(f"{daily_bin_column} = bin(todatetime(msg_data.data_hora), 1d)")
         group_by_columns.append(daily_bin_column)
         daily_order_by_kql = f"{daily_bin_column} asc, "
 
-    # --- LÓGICA ATUALIZADA PARA TRATAR job_id ---
+    # --- BUG CORRIGIDO ---
+    # A lógica de 'job_id' vs 'tokens' foi movida para tratar
+    # 'todouble()' vs 'tostring()' e 'dcount()'
     
-    # Se a coluna alvo for job_id, é uma contagem distinta (dcount), não uma operação matemática.
     if coluna_alvo == "job_id":
+        # Lógica especial para contar Jobs Únicos
         if operacao not in ["count", "dcount"]:
              raise HTTPException(status_code=400, 
-                detail="A operação para 'coluna_alvo=job_id' deve ser 'count' (para contar jobs únicos).")
+                detail="A operação para 'coluna_alvo=job_id' deve ser 'count' ou 'dcount'.")
         
-        # Força a operação para 'dcount' (distinct count)
-        operacao = "dcount" 
-        nome_coluna = "Contagem_Jobs_Unicos" # Sobrescreve o nome da coluna de saída
-        # A coluna é um 'tostring', não 'todouble'
+        operacao = "dcount" # Força a contagem distinta
+        nome_coluna = "Contagem_Jobs_Unicos" # Sobrescreve o nome da coluna
         extend_expressions.append(f"{coluna_alvo} = tostring(msg_data.{coluna_alvo})")
-        # A análise por job não faz sentido se já estamos contando jobs
-        analisar_por_job = False 
+        where_conditions.append(f"isnotnull({coluna_alvo})") # Adiciona a condição base
+        analisar_por_job = False # Desativa a análise de 2 estágios (não faz sentido)
     else:
-        # Lógica original para colunas numéricas (tokens_entrada, tokens_saida)
+        # Lógica padrão para colunas numéricas (tokens_entrada, tokens_saida)
         extend_expressions.append(f"{coluna_alvo} = todouble(msg_data.{coluna_alvo})")
+        where_conditions.append(f"isnotnull({coluna_alvo})") # Adiciona a condição base
+    
+    # --- FIM DA CORREÇÃO DO BUG ---
 
-
-    # 3. Cláusula de agrupamento final
+    # 5. Cláusula de agrupamento final
     group_by_clause = ", ".join(group_by_columns)
     
-    # 4. Cláusula de ordenação final
+    # 6. Cláusula de ordenação final
     order_by_clause = f"projeto asc, {daily_order_by_kql}{nome_coluna} desc"
     
     kql_query = ""
     
     if not analisar_por_job:
-        # --- LÓGICA PADRÃO: Agregação por evento (ou dcount de job_id) ---
+        # --- LÓGICA PADRÃO ---
         extend_clause = ",\n            ".join(extend_expressions)
+        where_clause = " and ".join(where_conditions) # --- ATUALIZADO ---
         
         kql_query = f"""
         AppTraces 
         | extend msg_data = parse_json(Message)
         | extend
             {extend_clause}
-        | where isnotnull({coluna_alvo}) 
+        | where {where_clause}
         | summarize
             {nome_coluna} = {operacao}({coluna_alvo})
             by {group_by_clause}
         | order by {order_by_clause}
         """
     else:
-        # --- LÓGICA POR JOB (só roda se coluna_alvo NÃO for 'job_id') ---
+        # --- LÓGICA POR JOB ---
         if operacao == "sum":
              raise HTTPException(status_code=400, 
                 detail="A operação 'sum' não é permitida com 'analisar_por_job=True'.")
@@ -108,6 +119,10 @@ def run_analytics_query(
         extend_expressions.append("job_id = tostring(msg_data.job_id)")
         extend_clause = ",\n            ".join(extend_expressions)
         
+        # Adiciona a condição do job_id ao 'where'
+        where_conditions.append("isnotnull(job_id)")
+        where_clause = " and ".join(where_conditions) # --- ATUALIZADO ---
+
         stage_1_groupby_columns = group_by_columns + ["job_id"]
         stage_1_groupby_clause = ", ".join(stage_1_groupby_columns)
         
@@ -116,7 +131,7 @@ def run_analytics_query(
         | extend msg_data = parse_json(Message)
         | extend
             {extend_clause}
-        | where isnotnull({coluna_alvo}) and isnotnull(job_id)
+        | where {where_clause}
         
         | summarize 
             job_token_total = sum({coluna_alvo}) 
@@ -155,13 +170,11 @@ def run_analytics_query(
 async def get_stats(
     dias: int = Query(default=30, gt=0, description="Período de análise em dias."),
     
-    # O Literal ainda aceita job_id, mas a lógica interna irá tratá-lo de forma especial
     coluna_alvo: Literal["tokens_entrada", "tokens_saida", "job_id"] = Query(
         default="tokens_entrada",
         description="A coluna de métrica a ser analisada. 'job_id' força uma contagem de jobs únicos."
     ),
     
-    # Adicionei 'dcount' às opções, embora o código o force para 'job_id'
     op: Literal["avg", "sum", "count", "min", "max", "dcount"] = Query(
         default="avg",
         description="A operação de agregação. Se coluna_alvo='job_id', 'count' ou 'dcount' deve ser usado."
@@ -186,12 +199,14 @@ async def get_stats(
     Executa uma análise agregada.
     - Se coluna_alvo for 'tokens_entrada' ou 'tokens_saida', executa a operação (avg, sum, etc).
     - Se coluna_alvo for 'job_id', executa uma contagem de jobs únicos (dcount), ignorando 'analisar_por_job'.
+    - Se agrupar_por_modelo=True, filtra registros onde 'model_name' é nulo.
     """
     
-    coluna_saida = ""
     # --- LÓGICA ATUALIZADA PARA NOME DA COLUNA ---
+    # (Corrigido o bug 'token' vs 'coluna_alvo' que existia no seu código)
+    coluna_saida = ""
     if coluna_alvo == "job_id":
-        coluna_saida = "Contagem_Jobs_Unicos" # Define um nome de coluna fixo e claro
+        coluna_saida = "Contagem_Jobs_Unicos"
     else:
         coluna_saida = f"{op.capitalize()}_{coluna_alvo}"
     
