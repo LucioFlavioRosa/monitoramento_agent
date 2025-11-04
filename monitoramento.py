@@ -45,8 +45,7 @@ def run_analytics_query(
     extend_expressions = [
         "projeto = tostring(msg_data.projeto)",
         "usuario_executor = tostring(msg_data.usuario_executor)",
-        "model_name = tostring(msg_data.model_name)",
-        f"{coluna_alvo} = todouble(msg_data.{coluna_alvo})"
+        "model_name = tostring(msg_data.model_name)"
     ]
     
     daily_order_by_kql = ""
@@ -57,7 +56,27 @@ def run_analytics_query(
         group_by_columns.append(daily_bin_column)
         daily_order_by_kql = f"{daily_bin_column} asc, "
 
-    # 3. Cláusula de agrupamento final (Estágio 2)
+    # --- LÓGICA ATUALIZADA PARA TRATAR job_id ---
+    
+    # Se a coluna alvo for job_id, é uma contagem distinta (dcount), não uma operação matemática.
+    if coluna_alvo == "job_id":
+        if operacao not in ["count", "dcount"]:
+             raise HTTPException(status_code=400, 
+                detail="A operação para 'coluna_alvo=job_id' deve ser 'count' (para contar jobs únicos).")
+        
+        # Força a operação para 'dcount' (distinct count)
+        operacao = "dcount" 
+        nome_coluna = "Contagem_Jobs_Unicos" # Sobrescreve o nome da coluna de saída
+        # A coluna é um 'tostring', não 'todouble'
+        extend_expressions.append(f"{coluna_alvo} = tostring(msg_data.{coluna_alvo})")
+        # A análise por job não faz sentido se já estamos contando jobs
+        analisar_por_job = False 
+    else:
+        # Lógica original para colunas numéricas (tokens_entrada, tokens_saida)
+        extend_expressions.append(f"{coluna_alvo} = todouble(msg_data.{coluna_alvo})")
+
+
+    # 3. Cláusula de agrupamento final
     group_by_clause = ", ".join(group_by_columns)
     
     # 4. Cláusula de ordenação final
@@ -66,10 +85,9 @@ def run_analytics_query(
     kql_query = ""
     
     if not analisar_por_job:
-        # --- LÓGICA PADRÃO: Agregação por evento ---
+        # --- LÓGICA PADRÃO: Agregação por evento (ou dcount de job_id) ---
         extend_clause = ",\n            ".join(extend_expressions)
         
-        # --- CORRIGIDO (coluna_alvo) ---
         kql_query = f"""
         AppTraces 
         | extend msg_data = parse_json(Message)
@@ -82,10 +100,10 @@ def run_analytics_query(
         | order by {order_by_clause}
         """
     else:
-        # --- NOVA LÓGICA: Agregação por Job (2 Estágios) ---
+        # --- LÓGICA POR JOB (só roda se coluna_alvo NÃO for 'job_id') ---
         if operacao == "sum":
              raise HTTPException(status_code=400, 
-                detail="A operação 'sum' não é permitida com 'analisar_por_job=True', pois a agregação primária já é uma soma.")
+                detail="A operação 'sum' não é permitida com 'analisar_por_job=True'.")
         
         extend_expressions.append("job_id = tostring(msg_data.job_id)")
         extend_clause = ",\n            ".join(extend_expressions)
@@ -93,7 +111,6 @@ def run_analytics_query(
         stage_1_groupby_columns = group_by_columns + ["job_id"]
         stage_1_groupby_clause = ", ".join(stage_1_groupby_columns)
         
-        # --- CORRIGIDO (coluna_alvo) ---
         kql_query = f"""
         AppTraces 
         | extend msg_data = parse_json(Message)
@@ -101,12 +118,10 @@ def run_analytics_query(
             {extend_clause}
         | where isnotnull({coluna_alvo}) and isnotnull(job_id)
         
-        // Estágio 1: "soma do job_id" (Soma os tokens para cada job E dia)
         | summarize 
             job_token_total = sum({coluna_alvo}) 
             by {stage_1_groupby_clause}
             
-        // Estágio 2: Aplica a operação principal (ex: avg) sobre os totais de cada job, por dia
         | summarize
             {nome_coluna} = {operacao}(job_token_total)
             by {group_by_clause}
@@ -138,18 +153,18 @@ def run_analytics_query(
 # --- ENDPOINT ATUALIZADO ---
 @app.get("/get_token_stats", response_model=List[Dict[str, Any]])
 async def get_stats(
-    # Validação automática de parâmetros de query:
     dias: int = Query(default=30, gt=0, description="Período de análise em dias."),
     
-    # --- CORRIGIDO (Literal) ---
+    # O Literal ainda aceita job_id, mas a lógica interna irá tratá-lo de forma especial
     coluna_alvo: Literal["tokens_entrada", "tokens_saida", "job_id"] = Query(
         default="tokens_entrada",
-        description="A coluna de métrica a ser analisada."
+        description="A coluna de métrica a ser analisada. 'job_id' força uma contagem de jobs únicos."
     ),
     
-    op: Literal["avg", "sum", "count", "min", "max"] = Query(
+    # Adicionei 'dcount' às opções, embora o código o force para 'job_id'
+    op: Literal["avg", "sum", "count", "min", "max", "dcount"] = Query(
         default="avg",
-        description="A operação de agregação a ser executada."
+        description="A operação de agregação. Se coluna_alvo='job_id', 'count' ou 'dcount' deve ser usado."
     ),
     
     agrupar_por_modelo: bool = Query(
@@ -159,7 +174,7 @@ async def get_stats(
     
     analisar_por_job: bool = Query(
         default=False,
-        description="Se True, analisa por total de Job (ex: média de Jobs) em vez de por evento."
+        description="Se True, analisa por total de Job (ex: média de Jobs). Ignorado se coluna_alvo='job_id'."
     ),
     
     resultado_diario: bool = Query(
@@ -168,14 +183,17 @@ async def get_stats(
     )
 ):
     """
-    Executa uma análise agregada dos tokens.
-    - `analisar_por_job=False`: Calcula a agregação por evento.
-    - `analisar_por_job=True`: Calcula a agregação por job (ex: avg(sum(job))).
-    - `resultado_diario=True`: Adiciona o 'dia' ao agrupamento final.
+    Executa uma análise agregada.
+    - Se coluna_alvo for 'tokens_entrada' ou 'tokens_saida', executa a operação (avg, sum, etc).
+    - Se coluna_alvo for 'job_id', executa uma contagem de jobs únicos (dcount), ignorando 'analisar_por_job'.
     """
     
-    # --- CORRIGIDO (coluna_alvo) ---
-    coluna_saida = f"{op.capitalize()}_{coluna_alvo}"
+    coluna_saida = ""
+    # --- LÓGICA ATUALIZADA PARA NOME DA COLUNA ---
+    if coluna_alvo == "job_id":
+        coluna_saida = "Contagem_Jobs_Unicos" # Define um nome de coluna fixo e claro
+    else:
+        coluna_saida = f"{op.capitalize()}_{coluna_alvo}"
     
     results = run_analytics_query(
         dias, coluna_alvo, op, coluna_saida, 
