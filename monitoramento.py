@@ -1,4 +1,3 @@
-# 1. Imports
 import pandas as pd
 import os
 from fastapi import FastAPI, Query, HTTPException
@@ -31,30 +30,29 @@ def run_analytics_query(
     nome_coluna: str, 
     agrupar_por_modelo: bool,
     analisar_por_job: bool,
-    resultado_diario: bool # --- PARÂMETRO ADICIONADO ---
+    resultado_diario: bool
 ) -> List[Dict[str, Any]]:
     """
     Executa uma query parametrizada no Log Analytics Workspace.
     """
     
-    # --- LÓGICA DE CONSTRUÇÃO DE QUERY ATUALIZADA ---
-
     # 1. Colunas de agrupamento base
     group_by_columns = ["projeto", "usuario_executor"]
     if agrupar_por_modelo:
         group_by_columns.append("model_name")
 
     # 2. Strings de KQL para agrupamento diário
-    daily_bin_extend_kql = ""  # Parte a ser adicionada no 'extend'
-    daily_order_by_kql = ""    # Parte a ser adicionada no 'order by'
+    daily_bin_extend_kql = ""
+    daily_order_by_kql = ""
 
     if resultado_diario:
         daily_bin_column = "dia"
-        # Adiciona a expressão de 'bin' para o 'extend'
-        daily_bin_extend_kql = f", {daily_bin_column} = bin(timestamp, 1d)"
-        # Adiciona a coluna 'dia' ao agrupamento
+        
+        # --- CORREÇÃO AQUI ---
+        # Corrigido de 'timestamp' para 'Timestamp' (T maiúsculo)
+        daily_bin_extend_kql = f", {daily_bin_column} = bin(Timestamp, 1d)"
+        
         group_by_columns.append(daily_bin_column)
-        # Adiciona o 'dia' à ordenação
         daily_order_by_kql = f"{daily_bin_column} asc, "
 
     # 3. Cláusula de agrupamento final (Estágio 2)
@@ -164,10 +162,9 @@ async def get_stats(
         description="Se True, analisa por total de Job (ex: média de Jobs) em vez de por evento."
     ),
     
-    # --- PARÂMETRO ADICIONADO ---
     resultado_diario: bool = Query(
         default=False,
-        description="Se True, agrupa os resultados por dia (bin(timestamp, 1d))."
+        description="Se True, agrupa os resultados por dia (bin(Timestamp, 1d))."
     )
 ):
     """
@@ -179,7 +176,6 @@ async def get_stats(
     
     coluna_saida = f"{op.capitalize()}_{token}"
     
-    # --- ATUALIZADO: Passa o novo parâmetro ---
     results = run_analytics_query(
         dias, token, op, coluna_saida, 
         agrupar_por_modelo, analisar_por_job, resultado_diario
