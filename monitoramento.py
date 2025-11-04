@@ -25,7 +25,7 @@ logs_client = LogsQueryClient(credential)
 # --- FUNÇÃO ATUALIZADA ---
 def run_analytics_query(
     dias: int, 
-    coluna_alvo: str, 
+    coluna_alvo: str,  # --- CORRIGIDO (nome) ---
     operacao: str, 
     nome_coluna: str, 
     agrupar_por_modelo: bool,
@@ -36,15 +36,12 @@ def run_analytics_query(
     Executa uma query parametrizada no Log Analytics Workspace.
     """
     
-    # --- LÓGICA DE CONSTRUÇÃO DE QUERY ATUALIZADA ---
-
     # 1. Colunas de agrupamento base
     group_by_columns = ["projeto", "usuario_executor"]
     if agrupar_por_modelo:
         group_by_columns.append("model_name")
 
     # 2. Lista de expressões 'extend'
-    #    Vamos construir o bloco 'extend' dinamicamente
     extend_expressions = [
         "projeto = tostring(msg_data.projeto)",
         "usuario_executor = tostring(msg_data.usuario_executor)",
@@ -56,10 +53,7 @@ def run_analytics_query(
 
     if resultado_diario:
         daily_bin_column = "dia"
-        # --- CORREÇÃO AQUI ---
-        # Adiciona a extração, conversão e bin da coluna 'data_hora' DE DENTRO do JSON
         extend_expressions.append(f"{daily_bin_column} = bin(todatetime(msg_data.data_hora), 1d)")
-        
         group_by_columns.append(daily_bin_column)
         daily_order_by_kql = f"{daily_bin_column} asc, "
 
@@ -73,18 +67,17 @@ def run_analytics_query(
     
     if not analisar_por_job:
         # --- LÓGICA PADRÃO: Agregação por evento ---
-        
-        # Junta todas as expressões 'extend' com vírgulas
         extend_clause = ",\n            ".join(extend_expressions)
         
+        # --- CORRIGIDO (coluna_alvo) ---
         kql_query = f"""
         AppTraces 
         | extend msg_data = parse_json(Message)
         | extend
             {extend_clause}
-        | where isnotnull({coluna_token})
+        | where isnotnull({coluna_alvo}) 
         | summarize
-            {nome_coluna} = {operacao}({coluna_token})
+            {nome_coluna} = {operacao}({coluna_alvo})
             by {group_by_clause}
         | order by {order_by_clause}
         """
@@ -94,105 +87,20 @@ def run_analytics_query(
              raise HTTPException(status_code=400, 
                 detail="A operação 'sum' não é permitida com 'analisar_por_job=True', pois a agregação primária já é uma soma.")
         
-        # Adiciona a extração do job_id para a lógica de job
         extend_expressions.append("job_id = tostring(msg_data.job_id)")
         extend_clause = ",\n            ".join(extend_expressions)
         
-        # O agrupamento do Estágio 1 precisa do job_id
         stage_1_groupby_columns = group_by_columns + ["job_id"]
         stage_1_groupby_clause = ", ".join(stage_1_groupby_columns)
         
+        # --- CORRIGIDO (coluna_alvo) ---
         kql_query = f"""
         AppTraces 
         | extend msg_data = parse_json(Message)
         | extend
             {extend_clause}
-        | where isnotnull({coluna_token}) and isnotnull(job_id)
+        | where isnotnull({coluna_alvo}) and isnotnull(job_id)
         
         // Estágio 1: "soma do job_id" (Soma os tokens para cada job E dia)
         | summarize 
-            job_token_total = sum({coluna_token}) 
-            by {stage_1_groupby_clause}
-            
-        // Estágio 2: Aplica a operação principal (ex: avg) sobre os totais de cada job, por dia
-        | summarize
-            {nome_coluna} = {operacao}(job_token_total)
-            by {group_by_clause}
-            
-        | order by {order_by_clause}
-        """
-
-    if not app_insights_workspace_id:
-        raise HTTPException(status_code=500, detail="LOG_ANALYTICS_WORKSPACE_ID não está configurado no servidor.")
-
-    try:
-        response = logs_client.query_workspace(
-            workspace_id=app_insights_workspace_id,
-            query=kql_query,
-            timespan=timedelta(days=dias)
-        )
-        
-        if response.tables:
-            df = pd.DataFrame(data=response.tables[0].rows, columns=response.tables[0].columns)
-            return df.to_dict('records')
-        else:
-            return [] 
-
-    except Exception as e:
-        print(f"Ocorreu um erro ao executar a query: {e}")
-        raise HTTPException(status_code=500, detail=f"Erro ao consultar o Log Analytics: {str(e)}")
-
-
-# --- ENDPOINT ATUALIZADO ---
-@app.get("/get_token_stats", response_model=List[Dict[str, Any]])
-async def get_stats(
-    # Validação automática de parâmetros de query:
-    dias: int = Query(default=30, gt=0, description="Período de análise em dias."),
-    
-    coluna_alvo: Literal["tokens_entrada", "tokens_saida", "job_id"] = Query(
-        default="tokens_entrada",
-        description="O tipo de token a ser analisado."
-    ),
-    
-    op: Literal["avg", "sum", "count", "min", "max"] = Query(
-        default="avg",
-        description="A operação de agregação a ser executada."
-    ),
-    
-    agrupar_por_modelo: bool = Query(
-        default=False,
-        description="Se True, agrupa os resultados também por 'model_name'."
-    ),
-    
-    analisar_por_job: bool = Query(
-        default=False,
-        description="Se True, analisa por total de Job (ex: média de Jobs) em vez de por evento."
-    ),
-    
-    resultado_diario: bool = Query(
-        default=False,
-        description="Se True, agrupa os resultados por dia (usando 'data_hora' do JSON)."
-    )
-):
-    """
-    Executa uma análise agregada dos tokens.
-    - `analisar_por_job=False`: Calcula a agregação por evento.
-    - `analisar_por_job=True`: Calcula a agregação por job (ex: avg(sum(job))).
-    - `resultado_diario=True`: Adiciona o 'dia' ao agrupamento final.
-    """
-    
-    coluna_saida = f"{op.capitalize()}_{token}"
-    
-    results = run_analytics_query(
-        dias, coluna_alvo, op, coluna_saida, 
-        agrupar_por_modelo, analisar_por_job, resultado_diario
-    )
-    
-    return results
-
-
-# 6. Ponto de Entrada para Teste Local
-if __name__ == "__main__":
-    print("--- Rodando em modo de teste local ---")
-    print("--- Certifique-se de ter rodado 'az login' no seu terminal ---")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+            job_token_total = sum
