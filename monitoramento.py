@@ -30,21 +30,38 @@ def run_analytics_query(
     operacao: str, 
     nome_coluna: str, 
     agrupar_por_modelo: bool,
-    analisar_por_job: bool  # --- PARÂMETRO ADICIONADO ---
+    analisar_por_job: bool,
+    resultado_diario: bool # --- PARÂMETRO ADICIONADO ---
 ) -> List[Dict[str, Any]]:
     """
     Executa uma query parametrizada no Log Analytics Workspace.
     """
     
-    # Constrói dinamicamente a cláusula de agrupamento (by)
+    # --- LÓGICA DE CONSTRUÇÃO DE QUERY ATUALIZADA ---
+
+    # 1. Colunas de agrupamento base
     group_by_columns = ["projeto", "usuario_executor"]
     if agrupar_por_modelo:
         group_by_columns.append("model_name")
-        
+
+    # 2. Strings de KQL para agrupamento diário
+    daily_bin_extend_kql = ""  # Parte a ser adicionada no 'extend'
+    daily_order_by_kql = ""    # Parte a ser adicionada no 'order by'
+
+    if resultado_diario:
+        daily_bin_column = "dia"
+        # Adiciona a expressão de 'bin' para o 'extend'
+        daily_bin_extend_kql = f", {daily_bin_column} = bin(timestamp, 1d)"
+        # Adiciona a coluna 'dia' ao agrupamento
+        group_by_columns.append(daily_bin_column)
+        # Adiciona o 'dia' à ordenação
+        daily_order_by_kql = f"{daily_bin_column} asc, "
+
+    # 3. Cláusula de agrupamento final (Estágio 2)
     group_by_clause = ", ".join(group_by_columns)
     
-    # --- LÓGICA DA QUERY ATUALIZADA ---
-    # A query KQL muda fundamentalmente se a análise for por Job.
+    # 4. Cláusula de ordenação final
+    order_by_clause = f"projeto asc, {daily_order_by_kql}{nome_coluna} desc"
     
     kql_query = ""
     
@@ -57,25 +74,23 @@ def run_analytics_query(
             projeto = tostring(msg_data.projeto),
             usuario_executor = tostring(msg_data.usuario_executor),
             model_name = tostring(msg_data.model_name),
-            {coluna_token} = todouble(msg_data.{coluna_token}) 
+            {coluna_token} = todouble(msg_data.{coluna_token})
+            {daily_bin_extend_kql} 
         | where isnotnull({coluna_token})
         | summarize
             {nome_coluna} = {operacao}({coluna_token})
             by {group_by_clause}
-        | order by projeto asc, {nome_coluna} desc
+        | order by {order_by_clause}
         """
     else:
         # --- NOVA LÓGICA: Agregação por Job (2 Estágios) ---
-        
-        # 1. Verifica se a operação principal é "sum"
-        # Se for, não podemos ter duas 'sum' (o KQL não permite 'sum(sum(..))'
-        # e a agregação de 2 estágios não faz sentido)
         if operacao == "sum":
              raise HTTPException(status_code=400, 
                 detail="A operação 'sum' não é permitida com 'analisar_por_job=True', pois a agregação primária já é uma soma.")
         
         # O agrupamento do Estágio 1 precisa do job_id
-        stage_1_groupby = group_by_clause + ", job_id"
+        stage_1_groupby_columns = group_by_columns + ["job_id"]
+        stage_1_groupby_clause = ", ".join(stage_1_groupby_columns)
         
         kql_query = f"""
         AppTraces 
@@ -85,20 +100,21 @@ def run_analytics_query(
             usuario_executor = tostring(msg_data.usuario_executor),
             model_name = tostring(msg_data.model_name),
             job_id = tostring(msg_data.job_id),
-            {coluna_token} = todouble(msg_data.{coluna_token}) 
+            {coluna_token} = todouble(msg_data.{coluna_token})
+            {daily_bin_extend_kql} 
         | where isnotnull({coluna_token}) and isnotnull(job_id)
         
-        // Estágio 1: "soma do job_id" (Soma os tokens para cada job)
+        // Estágio 1: "soma do job_id" (Soma os tokens para cada job E dia)
         | summarize 
             job_token_total = sum({coluna_token}) 
-            by {stage_1_groupby}
+            by {stage_1_groupby_clause}
             
-        // Estágio 2: Aplica a operação principal (ex: avg) sobre os totais de cada job
+        // Estágio 2: Aplica a operação principal (ex: avg) sobre os totais de cada job, por dia
         | summarize
             {nome_coluna} = {operacao}(job_token_total)
             by {group_by_clause}
             
-        | order by projeto asc, {nome_coluna} desc
+        | order by {order_by_clause}
         """
 
     if not app_insights_workspace_id:
@@ -143,16 +159,22 @@ async def get_stats(
         description="Se True, agrupa os resultados também por 'model_name'."
     ),
     
-    # --- PARÂMETRO ADICIONADO ---
     analisar_por_job: bool = Query(
         default=False,
         description="Se True, analisa por total de Job (ex: média de Jobs) em vez de por evento."
+    ),
+    
+    # --- PARÂMETRO ADICIONADO ---
+    resultado_diario: bool = Query(
+        default=False,
+        description="Se True, agrupa os resultados por dia (bin(timestamp, 1d))."
     )
 ):
     """
     Executa uma análise agregada dos tokens.
-    - `analisar_por_job=False` (padrão): Calcula a agregação por evento (ex: avg(evento)).
+    - `analisar_por_job=False`: Calcula a agregação por evento.
     - `analisar_por_job=True`: Calcula a agregação por job (ex: avg(sum(job))).
+    - `resultado_diario=True`: Adiciona o 'dia' ao agrupamento final.
     """
     
     coluna_saida = f"{op.capitalize()}_{token}"
@@ -160,7 +182,7 @@ async def get_stats(
     # --- ATUALIZADO: Passa o novo parâmetro ---
     results = run_analytics_query(
         dias, token, op, coluna_saida, 
-        agrupar_por_modelo, analisar_por_job
+        agrupar_por_modelo, analisar_por_job, resultado_diario
     )
     
     return results
