@@ -1,3 +1,4 @@
+# 1. Imports
 import pandas as pd
 import os
 from fastapi import FastAPI, Query, HTTPException
@@ -17,6 +18,8 @@ app = FastAPI(
 app_insights_workspace_id = os.environ.get("LOG_ANALYTICS_WORKSPACE_ID")
 if not app_insights_workspace_id:
     print("AVISO: Variável de ambiente LOG_ANALYTICS_WORKSPACE_ID não definida.")
+    # Você pode definir um valor padrão para teste local se não quiser usar 'az login'
+    # app_insights_workspace_id = "SEU_WORKSPACE_ID_PARA_TESTE_LOCAL"
 
 credential = DefaultAzureCredential()
 logs_client = LogsQueryClient(credential)
@@ -28,7 +31,7 @@ def run_analytics_query(dias: int, coluna_token: str, operacao: str, nome_coluna
     Executa uma query parametrizada no Log Analytics Workspace.
     """
     
-    # --- LÓGICA ADICIONADA ---
+    # Constrói dinamicamente a cláusula de agrupamento (by)
     group_by_columns = ["projeto", "usuario_executor"]
     if agrupar_por_modelo:
         group_by_columns.append("model_name")
@@ -36,18 +39,21 @@ def run_analytics_query(dias: int, coluna_token: str, operacao: str, nome_coluna
     # Converte a lista de colunas em uma string para o KQL
     group_by_clause = ", ".join(group_by_columns)
     
+    
+    # --- CORREÇÃO AQUI ---
+    # Removidos os comentários Python (#) que estavam dentro da string KQL.
     kql_query = f"""
     AppTraces 
     | extend msg_data = parse_json(Message)
     | extend
         projeto = tostring(msg_data.projeto),
         usuario_executor = tostring(msg_data.usuario_executor),
-        model_name = tostring(msg_data.model_name), # --- ADICIONADO: Extrai o model_name
+        model_name = tostring(msg_data.model_name),
         {coluna_token} = todouble(msg_data.{coluna_token}) 
     | where isnotnull({coluna_token})
     | summarize
         {nome_coluna} = {operacao}({coluna_token})
-        by {group_by_clause} # --- ATUALIZADO: para usar a cláusula dinâmica
+        by {group_by_clause}
     | order by projeto asc, {nome_coluna} desc
     """
 
@@ -65,7 +71,6 @@ def run_analytics_query(dias: int, coluna_token: str, operacao: str, nome_coluna
             df = pd.DataFrame(data=response.tables[0].rows, columns=response.tables[0].columns)
             return df.to_dict('records')  # Retorna uma lista de dicionários
         else:
-            # --- ATUALIZADO: Retorna lista vazia para ser compatível com o response_model
             return [] 
 
     except Exception as e:
@@ -90,7 +95,6 @@ async def get_stats(
         description="A operação de agregação a ser executada."
     ),
     
-    # --- PARÂMETRO ADICIONADO ---
     agrupar_por_modelo: bool = Query(
         default=False,
         description="Se True, agrupa os resultados também por 'model_name'."
@@ -104,7 +108,6 @@ async def get_stats(
     coluna_saida = f"{op.capitalize()}_{token}"  # Ex: "Avg_tokens_entrada"
     
     # Chama a função de lógica (FastAPI rodará isso em um thread pool)
-    # --- ATUALIZADO: Passa o novo parâmetro ---
     results = run_analytics_query(dias, token, op, coluna_saida, agrupar_por_modelo)
     
     # FastAPI converte o retorno (lista de dicts) em JSON automaticamente
