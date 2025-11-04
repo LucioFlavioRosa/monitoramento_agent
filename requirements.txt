@@ -1,7 +1,8 @@
-fastapi
+fastapi==0.121.0
+pydantic==2.12.3
 uvicorn
 gunicorn
-pandas
-azure-monitor-query
-azure-identity
-typing-extensions
+pandas==2.3.3
+azure-monitor-query==2.0.0
+azure-identity==1.25.1
+typing-extensions==4.15.0
