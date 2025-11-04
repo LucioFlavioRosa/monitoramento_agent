@@ -25,7 +25,7 @@ logs_client = LogsQueryClient(credential)
 # --- FUNÇÃO ATUALIZADA ---
 def run_analytics_query(
     dias: int, 
-    coluna_alvo: str,  # --- CORRIGIDO (nome) ---
+    coluna_alvo: str, 
     operacao: str, 
     nome_coluna: str, 
     agrupar_por_modelo: bool,
@@ -103,4 +103,90 @@ def run_analytics_query(
         
         // Estágio 1: "soma do job_id" (Soma os tokens para cada job E dia)
         | summarize 
-            job_token_total = sum
+            job_token_total = sum({coluna_alvo}) 
+            by {stage_1_groupby_clause}
+            
+        // Estágio 2: Aplica a operação principal (ex: avg) sobre os totais de cada job, por dia
+        | summarize
+            {nome_coluna} = {operacao}(job_token_total)
+            by {group_by_clause}
+            
+        | order by {order_by_clause}
+        """
+
+    if not app_insights_workspace_id:
+        raise HTTPException(status_code=500, detail="LOG_ANALYTICS_WORKSPACE_ID não está configurado no servidor.")
+
+    try:
+        response = logs_client.query_workspace(
+            workspace_id=app_insights_workspace_id,
+            query=kql_query,
+            timespan=timedelta(days=dias)
+        )
+        
+        if response.tables:
+            df = pd.DataFrame(data=response.tables[0].rows, columns=response.tables[0].columns)
+            return df.to_dict('records')
+        else:
+            return [] 
+
+    except Exception as e:
+        print(f"Ocorreu um erro ao executar a query: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro ao consultar o Log Analytics: {str(e)}")
+
+
+# --- ENDPOINT ATUALIZADO ---
+@app.get("/get_token_stats", response_model=List[Dict[str, Any]])
+async def get_stats(
+    # Validação automática de parâmetros de query:
+    dias: int = Query(default=30, gt=0, description="Período de análise em dias."),
+    
+    # --- CORRIGIDO (Literal) ---
+    coluna_alvo: Literal["tokens_entrada", "tokens_saida"] = Query(
+        default="tokens_entrada",
+        description="A coluna de métrica a ser analisada."
+    ),
+    
+    op: Literal["avg", "sum", "count", "min", "max"] = Query(
+        default="avg",
+        description="A operação de agregação a ser executada."
+    ),
+    
+    agrupar_por_modelo: bool = Query(
+        default=False,
+        description="Se True, agrupa os resultados também por 'model_name'."
+    ),
+    
+    analisar_por_job: bool = Query(
+        default=False,
+        description="Se True, analisa por total de Job (ex: média de Jobs) em vez de por evento."
+    ),
+    
+    resultado_diario: bool = Query(
+        default=False,
+        description="Se True, agrupa os resultados por dia (usando 'data_hora' do JSON)."
+    )
+):
+    """
+    Executa uma análise agregada dos tokens.
+    - `analisar_por_job=False`: Calcula a agregação por evento.
+    - `analisar_por_job=True`: Calcula a agregação por job (ex: avg(sum(job))).
+    - `resultado_diario=True`: Adiciona o 'dia' ao agrupamento final.
+    """
+    
+    # --- CORRIGIDO (coluna_alvo) ---
+    coluna_saida = f"{op.capitalize()}_{coluna_alvo}"
+    
+    results = run_analytics_query(
+        dias, coluna_alvo, op, coluna_saida, 
+        agrupar_por_modelo, analisar_por_job, resultado_diario
+    )
+    
+    return results
+
+
+# 6. Ponto de Entrada para Teste Local
+if __name__ == "__main__":
+    print("--- Rodando em modo de teste local ---")
+    print("--- Certifique-se de ter rodado 'az login' no seu terminal ---")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
