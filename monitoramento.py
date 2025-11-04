@@ -22,7 +22,7 @@ credential = DefaultAzureCredential()
 logs_client = LogsQueryClient(credential)
 
 
-# --- FUNÇÃO ATUALIZADA ---
+# --- FUNÇÃO ATUALIZADA (Lógica de query reescrita) ---
 def run_analytics_query(
     dias: int, 
     coluna_alvo: str, 
@@ -36,60 +36,61 @@ def run_analytics_query(
     Executa uma query parametrizada no Log Analytics Workspace.
     """
     
-    # 1. Colunas de agrupamento base
-    group_by_columns = ["projeto", "usuario_executor"]
+    # --- LÓGICA DE CONSTRUÇÃO DE QUERY ATUALIZADA ---
+
+    # 1. Colunas de agrupamento base (Grupo para 'summarize')
+    group_by_columns = ["projeto"] # 'projeto' é obrigatório
+
+    # 2. Expressões de 'extend' (para criar as colunas)
+    extend_expressions = ["projeto = tostring(msg_data.projeto)"]
+
+    # 3. Condições de 'where' (Filtro 'not null')
+    # REGRA NOVA: 'projeto' é sempre obrigatório
+    where_conditions = ["isnotnull(msg_data.projeto)"]
+
+    # ---
+    # REGRA NOVA: Adiciona 'usuario_executor' ao 'extend' e 'group_by',
+    # mas NÃO ao 'where'. É a única exceção.
+    group_by_columns.append("usuario_executor")
+    extend_expressions.append("usuario_executor = tostring(msg_data.usuario_executor)")
+    # ---
+
+    # 4. Lógica condicional para 'model_name'
     if agrupar_por_modelo:
         group_by_columns.append("model_name")
+        extend_expressions.append("model_name = tostring(msg_data.model_name)")
+        # REGRA NOVA: Se agrupar, deve ser not null
+        where_conditions.append("isnotnull(msg_data.model_name)") 
 
-    # 2. Lista de expressões 'extend' (base)
-    extend_expressions = [
-        "projeto = tostring(msg_data.projeto)",
-        "usuario_executor = tostring(msg_data.usuario_executor)",
-        "model_name = tostring(msg_data.model_name)"
-    ]
-    
-    # 3. Lista de condições 'where' (base)
-    # --- LÓGICA ATUALIZADA ---
-    where_conditions = [] # Começa vazia
-    if agrupar_por_modelo:
-        # --- NOVA CONDIÇÃO ADICIONADA ---
-        # Se vamos agrupar por modelo, filtramos os nulos.
-        where_conditions.append("isnotnull(model_name)")
-
-    # 4. Lógica de agrupamento diário
+    # 5. Lógica condicional para 'resultado_diario'
     daily_order_by_kql = ""
     if resultado_diario:
         daily_bin_column = "dia"
-        extend_expressions.append(f"{daily_bin_column} = bin(todatetime(msg_data.data_hora), 1d)")
         group_by_columns.append(daily_bin_column)
+        extend_expressions.append(f"{daily_bin_column} = bin(todatetime(msg_data.data_hora), 1d)")
+        # REGRA NOVA: Se agrupar por dia, a data não pode ser nula
+        where_conditions.append("isnotnull(msg_data.data_hora)")
         daily_order_by_kql = f"{daily_bin_column} asc, "
 
-    # --- BUG CORRIGIDO ---
-    # A lógica de 'job_id' vs 'tokens' foi movida para tratar
-    # 'todouble()' vs 'tostring()' e 'dcount()'
-    
+    # 6. Lógica condicional para 'coluna_alvo' (Métrica)
     if coluna_alvo == "job_id":
-        # Lógica especial para contar Jobs Únicos
+        # Se o alvo for 'job_id', a operação é uma contagem distinta
         if operacao not in ["count", "dcount"]:
              raise HTTPException(status_code=400, 
                 detail="A operação para 'coluna_alvo=job_id' deve ser 'count' ou 'dcount'.")
         
-        operacao = "dcount" # Força a contagem distinta
+        operacao = "dcount" # Força a contagem de jobs únicos
         nome_coluna = "Contagem_Jobs_Unicos" # Sobrescreve o nome da coluna
         extend_expressions.append(f"{coluna_alvo} = tostring(msg_data.{coluna_alvo})")
-        where_conditions.append(f"isnotnull({coluna_alvo})") # Adiciona a condição base
-        analisar_por_job = False # Desativa a análise de 2 estágios (não faz sentido)
+        where_conditions.append(f"isnotnull(msg_data.{coluna_alvo})") # REGRA NOVA
+        analisar_por_job = False # Desativa a lógica de 2 estágios
     else:
-        # Lógica padrão para colunas numéricas (tokens_entrada, tokens_saida)
+        # Lógica padrão para colunas numéricas (tokens)
         extend_expressions.append(f"{coluna_alvo} = todouble(msg_data.{coluna_alvo})")
-        where_conditions.append(f"isnotnull({coluna_alvo})") # Adiciona a condição base
-    
-    # --- FIM DA CORREÇÃO DO BUG ---
-
-    # 5. Cláusula de agrupamento final
+        where_conditions.append(f"isnotnull(msg_data.{coluna_alvo})") # REGRA NOVA
+        
+    # 7. Cláusulas Finais
     group_by_clause = ", ".join(group_by_columns)
-    
-    # 6. Cláusula de ordenação final
     order_by_clause = f"projeto asc, {daily_order_by_kql}{nome_coluna} desc"
     
     kql_query = ""
@@ -97,7 +98,7 @@ def run_analytics_query(
     if not analisar_por_job:
         # --- LÓGICA PADRÃO ---
         extend_clause = ",\n            ".join(extend_expressions)
-        where_clause = " and ".join(where_conditions) # --- ATUALIZADO ---
+        where_clause = " and ".join(where_conditions) # Cláusula 'where' dinâmica
         
         kql_query = f"""
         AppTraces 
@@ -116,12 +117,12 @@ def run_analytics_query(
              raise HTTPException(status_code=400, 
                 detail="A operação 'sum' não é permitida com 'analisar_por_job=True'.")
         
+        # Adiciona 'job_id' às cláusulas
         extend_expressions.append("job_id = tostring(msg_data.job_id)")
-        extend_clause = ",\n            ".join(extend_expressions)
+        where_conditions.append("isnotnull(msg_data.job_id)") # REGRA NOVA
         
-        # Adiciona a condição do job_id ao 'where'
-        where_conditions.append("isnotnull(job_id)")
-        where_clause = " and ".join(where_conditions) # --- ATUALIZADO ---
+        extend_clause = ",\n            ".join(extend_expressions)
+        where_clause = " and ".join(where_conditions) # Cláusula 'where' dinâmica
 
         stage_1_groupby_columns = group_by_columns + ["job_id"]
         stage_1_groupby_clause = ", ".join(stage_1_groupby_columns)
@@ -165,7 +166,7 @@ def run_analytics_query(
         raise HTTPException(status_code=500, detail=f"Erro ao consultar o Log Analytics: {str(e)}")
 
 
-# --- ENDPOINT ATUALIZADO ---
+# --- ENDPOINT ATUALIZADO (Corrigido o bug 'token' vs 'coluna_alvo') ---
 @app.get("/get_token_stats", response_model=List[Dict[str, Any]])
 async def get_stats(
     dias: int = Query(default=30, gt=0, description="Período de análise em dias."),
@@ -197,14 +198,13 @@ async def get_stats(
 ):
     """
     Executa uma análise agregada.
-    - Se coluna_alvo for 'tokens_entrada' ou 'tokens_saida', executa a operação (avg, sum, etc).
-    - Se coluna_alvo for 'job_id', executa uma contagem de jobs únicos (dcount), ignorando 'analisar_por_job'.
-    - Se agrupar_por_modelo=True, filtra registros onde 'model_name' é nulo.
+    - `analisar_por_job=False`: Calcula a agregação por evento.
+    - `analisar_por_job=True`: Calcula a agregação por job (ex: avg(sum(job))).
+    - `resultado_diario=True`: Adiciona o 'dia' ao agrupamento final.
     """
     
-    # --- LÓGICA ATUALIZADA PARA NOME DA COLUNA ---
-    # (Corrigido o bug 'token' vs 'coluna_alvo' que existia no seu código)
     coluna_saida = ""
+    # --- CORRIGIDO: Bug de nome de variável (usava 'token' que não existe mais) ---
     if coluna_alvo == "job_id":
         coluna_saida = "Contagem_Jobs_Unicos"
     else:
