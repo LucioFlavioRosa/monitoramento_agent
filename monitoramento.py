@@ -1,17 +1,35 @@
 import pandas as pd
 import os
 from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware  # <<< 1. IMPORTAR O MIDDLEWARE
 from azure.monitor.query import LogsQueryClient
 from azure.identity import DefaultAzureCredential
 from datetime import timedelta
 from typing import Literal, List, Dict, Any
-import uvicorn  # Para rodar localmente
+import uvicorn
 
 # 2. Inicialização do FastAPI
 app = FastAPI(
     title="Monitoramento",
     description="Um backend que consulta o Application Insights usando Identidade Gerenciada."
 )
+
+# 3. CONFIGURAÇÃO DO CORS (Adicionar este bloco) # <<< 2. ADICIONAR ESTE BLOCO
+# -----------------------------------------------------------------
+origins = [
+    "http://localhost:8000",  # O seu servidor Python local
+    "http://127.0.0.1:8000", # Outra forma de acessar o localhost
+    # "https://seu-site-em-producao.com", # Adicione a URL do seu frontend quando for para produção
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,       # Quais origens podem fazer requisições
+    allow_credentials=True,    # Permitir cookies (se necessário)
+    allow_methods=["*"],       # Quais métodos são permitidos (GET, POST, etc.)
+    allow_headers=["*"],       # Quais headers são permitidos
+)
+# ----------------------------------------------------------------- # <<< FIM DO BLOCO
 
 # Pega o Workspace ID das "Configurações do Aplicativo" do App Service
 app_insights_workspace_id = os.environ.get("LOG_ANALYTICS_WORKSPACE_ID")
@@ -76,8 +94,8 @@ def run_analytics_query(
     if coluna_alvo == "job_id":
         # Se o alvo for 'job_id', a operação é uma contagem distinta
         if operacao not in ["count", "dcount"]:
-             raise HTTPException(status_code=400, 
-                detail="A operação para 'coluna_alvo=job_id' deve ser 'count' ou 'dcount'.")
+                raise HTTPException(status_code=400, 
+                    detail="A operação para 'coluna_alvo=job_id' deve ser 'count' ou 'dcount'.")
         
         operacao = "dcount" # Força a contagem de jobs únicos
         nome_coluna = "Contagem_Jobs_Unicos" # Sobrescreve o nome da coluna
@@ -114,8 +132,8 @@ def run_analytics_query(
     else:
         # --- LÓGICA POR JOB ---
         if operacao == "sum":
-             raise HTTPException(status_code=400, 
-                detail="A operação 'sum' não é permitida com 'analisar_por_job=True'.")
+                raise HTTPException(status_code=400, 
+                    detail="A operação 'sum' não é permitida com 'analisar_por_job=True'.")
         
         # Adiciona 'job_id' às cláusulas
         extend_expressions.append("job_id = tostring(msg_data.job_id)")
