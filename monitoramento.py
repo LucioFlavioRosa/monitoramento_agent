@@ -18,15 +18,20 @@ app = FastAPI(
 app_insights_workspace_id = os.environ.get("LOG_ANALYTICS_WORKSPACE_ID")
 if not app_insights_workspace_id:
     print("AVISO: Variável de ambiente LOG_ANALYTICS_WORKSPACE_ID não definida.")
-    # Você pode definir um valor padrão para teste local se não quiser usar 'az login'
-    # app_insights_workspace_id = "SEU_WORKSPACE_ID_PARA_TESTE_LOCAL"
 
 credential = DefaultAzureCredential()
 logs_client = LogsQueryClient(credential)
 
 
 # --- FUNÇÃO ATUALIZADA ---
-def run_analytics_query(dias: int, coluna_token: str, operacao: str, nome_coluna: str, agrupar_por_modelo: bool) -> List[Dict[str, Any]]:
+def run_analytics_query(
+    dias: int, 
+    coluna_token: str, 
+    operacao: str, 
+    nome_coluna: str, 
+    agrupar_por_modelo: bool,
+    analisar_por_job: bool  # --- PARÂMETRO ADICIONADO ---
+) -> List[Dict[str, Any]]:
     """
     Executa uma query parametrizada no Log Analytics Workspace.
     """
@@ -36,26 +41,65 @@ def run_analytics_query(dias: int, coluna_token: str, operacao: str, nome_coluna
     if agrupar_por_modelo:
         group_by_columns.append("model_name")
         
-    # Converte a lista de colunas em uma string para o KQL
     group_by_clause = ", ".join(group_by_columns)
     
+    # --- LÓGICA DA QUERY ATUALIZADA ---
+    # A query KQL muda fundamentalmente se a análise for por Job.
     
-    # --- CORREÇÃO AQUI ---
-    # Removidos os comentários Python (#) que estavam dentro da string KQL.
-    kql_query = f"""
-    AppTraces 
-    | extend msg_data = parse_json(Message)
-    | extend
-        projeto = tostring(msg_data.projeto),
-        usuario_executor = tostring(msg_data.usuario_executor),
-        model_name = tostring(msg_data.model_name),
-        {coluna_token} = todouble(msg_data.{coluna_token}) 
-    | where isnotnull({coluna_token})
-    | summarize
-        {nome_coluna} = {operacao}({coluna_token})
-        by {group_by_clause}
-    | order by projeto asc, {nome_coluna} desc
-    """
+    kql_query = ""
+    
+    if not analisar_por_job:
+        # --- LÓGICA PADRÃO: Agregação por evento ---
+        kql_query = f"""
+        AppTraces 
+        | extend msg_data = parse_json(Message)
+        | extend
+            projeto = tostring(msg_data.projeto),
+            usuario_executor = tostring(msg_data.usuario_executor),
+            model_name = tostring(msg_data.model_name),
+            {coluna_token} = todouble(msg_data.{coluna_token}) 
+        | where isnotnull({coluna_token})
+        | summarize
+            {nome_coluna} = {operacao}({coluna_token})
+            by {group_by_clause}
+        | order by projeto asc, {nome_coluna} desc
+        """
+    else:
+        # --- NOVA LÓGICA: Agregação por Job (2 Estágios) ---
+        
+        # 1. Verifica se a operação principal é "sum"
+        # Se for, não podemos ter duas 'sum' (o KQL não permite 'sum(sum(..))'
+        # e a agregação de 2 estágios não faz sentido)
+        if operacao == "sum":
+             raise HTTPException(status_code=400, 
+                detail="A operação 'sum' não é permitida com 'analisar_por_job=True', pois a agregação primária já é uma soma.")
+        
+        # O agrupamento do Estágio 1 precisa do job_id
+        stage_1_groupby = group_by_clause + ", job_id"
+        
+        kql_query = f"""
+        AppTraces 
+        | extend msg_data = parse_json(Message)
+        | extend
+            projeto = tostring(msg_data.projeto),
+            usuario_executor = tostring(msg_data.usuario_executor),
+            model_name = tostring(msg_data.model_name),
+            job_id = tostring(msg_data.job_id),
+            {coluna_token} = todouble(msg_data.{coluna_token}) 
+        | where isnotnull({coluna_token}) and isnotnull(job_id)
+        
+        // Estágio 1: "soma do job_id" (Soma os tokens para cada job)
+        | summarize 
+            job_token_total = sum({coluna_token}) 
+            by {stage_1_groupby}
+            
+        // Estágio 2: Aplica a operação principal (ex: avg) sobre os totais de cada job
+        | summarize
+            {nome_coluna} = {operacao}(job_token_total)
+            by {group_by_clause}
+            
+        | order by projeto asc, {nome_coluna} desc
+        """
 
     if not app_insights_workspace_id:
         raise HTTPException(status_code=500, detail="LOG_ANALYTICS_WORKSPACE_ID não está configurado no servidor.")
@@ -69,12 +113,11 @@ def run_analytics_query(dias: int, coluna_token: str, operacao: str, nome_coluna
         
         if response.tables:
             df = pd.DataFrame(data=response.tables[0].rows, columns=response.tables[0].columns)
-            return df.to_dict('records')  # Retorna uma lista de dicionários
+            return df.to_dict('records')
         else:
             return [] 
 
     except Exception as e:
-        # Se a query falhar (ex: erro de sintaxe), retorna um erro 500
         print(f"Ocorreu um erro ao executar a query: {e}")
         raise HTTPException(status_code=500, detail=f"Erro ao consultar o Log Analytics: {str(e)}")
 
@@ -98,19 +141,28 @@ async def get_stats(
     agrupar_por_modelo: bool = Query(
         default=False,
         description="Se True, agrupa os resultados também por 'model_name'."
+    ),
+    
+    # --- PARÂMETRO ADICIONADO ---
+    analisar_por_job: bool = Query(
+        default=False,
+        description="Se True, analisa por total de Job (ex: média de Jobs) em vez de por evento."
     )
 ):
     """
-    Executa uma análise agregada dos tokens de entrada ou saída
-    agrupados por projeto e usuário (e opcionalmente por modelo).
+    Executa uma análise agregada dos tokens.
+    - `analisar_por_job=False` (padrão): Calcula a agregação por evento (ex: avg(evento)).
+    - `analisar_por_job=True`: Calcula a agregação por job (ex: avg(sum(job))).
     """
     
-    coluna_saida = f"{op.capitalize()}_{token}"  # Ex: "Avg_tokens_entrada"
+    coluna_saida = f"{op.capitalize()}_{token}"
     
-    # Chama a função de lógica (FastAPI rodará isso em um thread pool)
-    results = run_analytics_query(dias, token, op, coluna_saida, agrupar_por_modelo)
+    # --- ATUALIZADO: Passa o novo parâmetro ---
+    results = run_analytics_query(
+        dias, token, op, coluna_saida, 
+        agrupar_por_modelo, analisar_por_job
+    )
     
-    # FastAPI converte o retorno (lista de dicts) em JSON automaticamente
     return results
 
 
